@@ -17,7 +17,6 @@ import cartopy.feature as cfeature
 from matplotlib import cm
 from scipy.interpolate import griddata
 import xarray as xr
-import xoak
 
 
 
@@ -43,6 +42,15 @@ def setup_map_global(fig, proj=ccrs.PlateCarree()):
     ax.gridlines(draw_labels=True)
     return ax
 
+def setup_map_global(fig, nrow, ncol, idx, region_extent=[-180, 180, -90, 90], proj=ccrs.PlateCarree()):
+    ax = fig.add_subplot(nrow, ncol, idx, projection=proj)
+    ax.set_global()
+    ax.coastlines(resolution='50m', linewidth=0.5)
+    ax.add_feature(cfeature.BORDERS, edgecolor='black', linewidth=0.25)
+    ax.gridlines(draw_labels=True)
+    ax.set_extent(region_extent, crs=proj)
+    return ax
+
 def fix_longitudes(lon):
     """fix longitude so that it is always from -180 to 180 
        (not 0 to 360)"""
@@ -50,26 +58,21 @@ def fix_longitudes(lon):
 
 def plot_map(x, y, data, ax=None, proj=None, method='tri', nlon=360, nlat=180, clabel=None, **kwargs):
     """plot a geologic map using triangulation"""
-    if ax is None:
-        ax = plt.gca()
     if proj is None:
         proj = ccrs.PlateCarree()
-    
-    ax.set_global()
-    ax.coastlines()
-    ax.add_feature(cfeature.STATES, edgecolor='black', linewidth=0.5)
-    gl = ax.gridlines(draw_labels=True)
-    gl.top_labels = False
+    if ax is None:
+        fig = plt.figure()
+        ax = setup_map_global(fig, proj=proj)
 
     x = fix_longitudes(x)
 
     if method in ['tri', 'triangulation']:
         im = ax.tripcolor(x, y, data, transform=proj, **kwargs)
-    # elif method=='regrid':
-    #     xi = np.linspace(-180, 180, int(nlon))
-    #     yi = np.linspace(-90, 90, int(nlat))
-    #     data_regridded = griddata((x, y), data, (xi[None,:], yi[:,None]), method='nearest')
-    #     pl = ax.pcolormesh(xi, yi, data_regridded, transform=ccrs.PlateCarree(), **kwargs)
+    elif method=='regrid':
+        xi = np.linspace(-180, 180, int(nlon))
+        yi = np.linspace(-90, 90, int(nlat))
+        data_regridded = griddata((x, y), data, (xi[None,:], yi[:,None]), method='nearest')
+        im = ax.pcolormesh(xi, yi, data_regridded, transform=ccrs.PlateCarree(), **kwargs)
     else:
         raise ValueError(f'method {method} not known')
     
@@ -78,36 +81,6 @@ def plot_map(x, y, data, ax=None, proj=None, method='tri', nlon=360, nlat=180, c
 
     # Return plot and colorbar
     return ax, cb
-
-def xoak_kdtree_sel(ds, lats, lons):
-    """
-    Uses xoak to select data with irregular dimensions
-
-    Parameters
-    ----------
-    ds : `xarray.Dataset`
-      Dataset with your data, with lat/lon dims in one-dimension
-
-    lats : list
-      List of latitudes to select
-
-    lons : list
-      List of longitudes to select
-
-    Returns
-    -------
-    ds : `xr.Dataset`
-      Dataset subset based on input lats/lons
-    """
-
-    # Checks to see if this has an xoak index - if not, create one using the extension
-    if not ds.xoak.index:
-        ds.xoak.set_index(("lat", "lon"), "scipy_kdtree")
-
-    # Return the selected datasets
-    return ds.xoak.sel(lat=xr.Variable("ncol", lats), lon=xr.Variable("ncol", lons))
-
-
 
 def dennisplot(stat, olr, alb, var=None, xbins=None, ybins=None, units=None, savename=None,
                levels=None, cmap=cm.ocean_r, ax=None, save=False, colorbar_on=True, fs=20, contour_on=False,

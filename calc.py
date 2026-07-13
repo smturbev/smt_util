@@ -121,4 +121,3 @@ def calc_geodesic_distance(latlon0, latlon1):
         Uses metpy package
     """
     return( geodesic(latlon0, latlon1).km * units.km)
-
