@@ -74,12 +74,16 @@ def calc_rice(qi, ni):
     r_ice = r_ice.metpy.convert_units('micrometers')  # um
     return r_ice
 
-
-def calc_ni(numice, qv, p, t):
+def calc_ni(numice, qv, p, t, debug=True):
     """returns icnc as 1/cm3"""
+    if debug:
+        print("UNIT CHECK:")
+        print("\tNUMICE:", numice.metpy.units)
+        print("\tQV    :", qv.metpy.units)
+        print("\tPRES  :", p.metpy.units)
+        print("\tTEMP  :", t.metpy.units)
     ni = numice * calc_rho(qv,p,t)  # 1/kg * kg/m3 = 1/m3
     return ni.metpy.convert_units('cm^-3')
-
 
 def calc_rho(qv, p, t):
     """calculates density of air in kg/m3 for given input"""

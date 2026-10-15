@@ -56,8 +56,13 @@ def subset_regrid_var(ds, varname, lat_bnds, lon_bnds, sel_lev=None,
     print("RESOLUTION", lat_res, lon_res)
     lat0, lat1 = lat_bnds
     lon0, lon1 = lon_bnds
-    lons = pf.fix_longitudes(ds.lon.values)
-    lats = ds.lat.values
+    lons = pf.fix_longitudes(ds.lon)
+    lats = ds.lat
+    if len(lons.shape)>1:
+        lons = lons.isel(time=0)
+        lats = lats.isel(time=0)
+        print("lat/lon shape", lats.shape, lons.shape)
+    
     try: 
         units = ds[varname].attrs["units"]
     except:
@@ -69,7 +74,7 @@ def subset_regrid_var(ds, varname, lat_bnds, lon_bnds, sel_lev=None,
             units = ""
     if 'lev' in ds.dims:
         var_masked_ds = var_masked_ds.sel(lev=sel_lev, method="nearest")
-    
+    print(ds[varname].shape)
     mask = np.where((lats>lat0)&(lats<lat1)&(lons>lon0)&(lons<lon1),1,0)
     mask_da = xr.DataArray(np.repeat(mask[np.newaxis,:], axis=0, repeats=ds[varname].shape[0]),
                            dims=ds.dims, coords=ds.coords)
@@ -79,10 +84,10 @@ def subset_regrid_var(ds, varname, lat_bnds, lon_bnds, sel_lev=None,
     # lat_masked = ds.lat.isel(ncol=mask, drop=True)
     # lon_masked = ds.lon.isel(ncol=mask, drop=True)
     var_masked = ds[varname].where(mask_da, drop=True)
-    lat_masked = ds["lat"].where(ncol_mask_da, drop=True)
-    lon_masked = ds["lon"].where(ncol_mask_da, drop=True)
+    lat_masked = lats.where(ncol_mask_da, drop=True)
+    lon_masked = lons.where(ncol_mask_da, drop=True)
     print(var_masked)
-    var_masked_ds = xr.Dataset({varname:var_masked, 'lat':lat_masked, 'lon':lon_masked},
+    var_masked_ds = xr.Dataset({varname:var_masked, 'lat':lat_masked.values, 'lon':lon_masked.values},
                                attrs={"lat_bnds":lat_bnds, "lon_bnds":lon_bnds})
     if plot_subset_map:
         fig = plt.figure(figsize=(6,4))
@@ -268,6 +273,114 @@ def regrid_w(file_name, lev=(250*mpunits.hPa), method="nearest",
                                    "units":"m/s"})
     return w_gridded
 
+def spatial_psd_vs_wavelength(x_m, w, dx=None, lonlat=False, fsmooth_nperseg=None,
+                              window='hann', noverlap=None, plot=True, label=None,
+                              t0=0, nt=None):
+    """
+    Compute spatial PSD of 1D field w(x) and plot PSD vs wavelength (km).
+    - x: 1D positions (meters)
+    - w: 1D values (m/s)
+    - dx: optional spacing in meters (if not provided, inferred from x)
+    - lonlat: if True, x must be tuple (lon_array, lat_array) in degrees
+    - fsmooth_nperseg: nperseg passed to welch; if None default chosen
+    Returns: (wavelength_km, PSD, freq_cpm) arrays used for plotting (wavelength in km).
+
+    # Example usage for even-spaced transect:
+    # x_m = np.arange(n) * dx_m   # or use lonlat=(lon_array, lat_array)
+    # wavelengths_km, Pxx, f_hz = spatial_psd_vs_wavelength(x_m, w_values, dx=dx_m)
+    """
+    if x_m.shape[0] != w.shape[1]:
+        raise ValueError("x and w must have same length: x ({x.shape}), w ({w.shape})")
+    w = np.asarray(w).astype('float64')
+    x_m = np.asarray(x_m).astype('float64')
+    # compute spacing - verify roughly uniform
+    dxs = np.diff(x_m)
+    dx_med = np.median(dxs)
+    if np.any(np.abs(dxs - dx_med) > 1e-6 * dx_med):
+        # not strictly uniform; warn and proceed by using median spacing
+        print("Warning: non-uniform spacing detected; using median dx = {:.3f} m for PSD.".format(dx_med))
+    dx_use = dx_med
+
+    # prepare PSD computation treating space as 'time'
+    # sampling frequency in cycles per meter (spatial sampling rate)
+    fs = 1.0 / dx_use   # samples (points) per meter
+    npts = w.shape[1]
+    nt = w.shape[0]
+    if fsmooth_nperseg is None:
+        # choose a sensible default: up to 1/8 of length, min 8
+        nperseg = min(8, npts // 8)
+    else:
+        nperseg = fsmooth_nperseg
+    if noverlap is None:
+        noverlap = nperseg // 2
+
+    # detrend by removing mean (you can change detrend behavior in welch call if desired)
+    w0 = w - np.nanmean(w)
+
+    # # handle NaNs: simple approach - mask NaNs by linear interpolation before PSD, or drop segments.
+    # if np.isnan(w0).any():
+    #     # linear interpolation over NaNs
+    #     idx = np.arange(npts)
+    #     valid = ~np.isnan(w0)
+    #     if valid.sum() < 3:
+    #         raise RuntimeError("Too many NaNs to interpolate for PSD.")
+    #     w0 = np.interp(idx, idx[valid], w0[valid])
+
+    # use scipy.signal.welch to compute spatial PSD; returns freq in cycles per meter
+    print(f"-----SETTINGS FOR PSD-----\n   w size={w.shape}\n       fs={fs}\n   window={window}\n  nperseg={nperseg}\n noverlap={noverlap}\n  detrend='constant'\n  scaling='density'")
+    f_hz_0, Pxx_0 = welch(w0[t0], fs=fs, window=window, nperseg=nperseg, noverlap=noverlap, detrend='constant', scaling='density')
+    print("f_hz0",1/f_hz_0)
+    f_hz = np.zeros((nt, len(f_hz_0)))
+    if len(Pxx_0.shape)==1:
+        Pxx = np.zeros((nt, len(Pxx_0)))
+    elif len(Pxx_0.shape)==2:
+        Pxx = np.empty((nt, Pxx_0.shape[0], Pxx_0.shape[1]))
+    else:
+        raise Exception("Define shape of Pxx as (nt,{Pxx_0.shape})")
+    f_hz[0] = f_hz_0
+    Pxx[0] = Pxx_0
+    print("shape Pxx=",Pxx.shape)
+    print("shape fhz=",f_hz.shape)
+    for t in range(t0,t0+nt):
+        f_hz[t], Pxx[t] = welch(w0[t], fs=fs, window=window, nperseg=nperseg, noverlap=noverlap, detrend='constant', scaling='density')
+    # f_hz: cycles per meter; convert to wavelength (meters) avoiding f=0
+    # nonzero = f_hz > 0
+    # wavelengths_m = np.empty_like(f_hz)
+    # wavelengths_m[~nonzero] = np.inf
+    wavelengths_m = 1.0 / f_hz
+    wavelengths_km = wavelengths_m / 1000.0
+
+    if plot:
+        print("-----Plotting PSD-----")
+        plt.figure(figsize=(7,5))
+        if "3.25" in label:
+            color="C0"
+        elif "1.3" in label:
+            color="C1"
+        elif "800" in label:
+            color="C2"
+        else:
+            color="k"
+        # Plot PSD vs wavelength; it's conventional to plot on log-log and invert x-axis (long wavelengths left)
+        plt.loglog(np.nanmean(wavelengths_km, axis=0), np.nanmean(Pxx, axis=(0)),
+                   label=(label if label else 'PSD'), color=color)
+        plt.gca().invert_xaxis()
+        plt.xlabel('Wavelength (km)')
+        plt.ylabel('PSD (m^2 per cycle/m)')  # units: (m/s)^2 per (cycles/m) -> interpret carefully
+        plt.title('Spatial PSD vs wavelength')
+        plt.grid(True, which='both', ls=':')
+        plt.legend(loc=3)
+        plt.ylim([1e3,1e8])
+        plt.xlim([200,1])
+        plt.tight_layout()
+        label=(label if label else 'PSD').replace(" ","").replace("(","").replace(")","")
+        savename=(find_figure_dir())+f"Pxx_mean_w_xylim_{label}.png"
+        plt.savefig(savename, transparent=True)
+        print("Saved figure as", savename)
+        plt.show()
+
+    return wavelengths_km, Pxx, f_hz
+
 def time_psd(w_sub, nperseg=None, spatial_mean=True):
     """
     w_sub : xarray dataarray with dims (time, ncol)
@@ -314,7 +427,7 @@ def time_psd(w_sub, nperseg=None, spatial_mean=True):
     else:
         return psd_array
 
-def calc_psd_welch(w_latlon, t0=4, fs=1.0, **kwargs):
+def calc_psd_welch(w_latlon, t0=0, fs=1.0, **kwargs):
     """
     Estimate power spectral density using Welch's method from scipy.signal.welch().
 
@@ -369,6 +482,66 @@ def calc_psd_welch(w_latlon, t0=4, fs=1.0, **kwargs):
                 freq_y, w_psd_y[tt,k,:] = welch(w_t[:,k], fs=fs, detrend='linear', nperseg=nkmin, **kwargs)
     return (freq_x, freq_y, w_psd_x, w_psd_y)
 
+def calc_psd_welch_line(w_cross, t0=0, fs=1.0, nt=None, nperseg=None, **kwargs):
+    """
+    Estimate power spectral density using Welch's method from scipy.signal.welch().
+
+    Welch's method [1]_ computes an estimate of the power spectral
+    density by dividing the data into overlapping segments, computing a
+    modified periodogram for each segment and averaging the
+    periodograms.
+
+    Parameters
+    ----------
+    w_cross : ndarray with dimensions (time, ncol)
+        xarray.DataArray of vertical velocity on a linear cross section
+    fs : float, optional
+        Sampling frequency across the cross section - ie. the grid spacing. Defaults to 1.0.
+    t0 : int, optional
+        Start sampling the data after t0 timesteps, this should be 2 days 
+        after model start to ignore model spin up. Defaults to 4.
+
+    Returns
+    ----------
+    freq : ndarray
+        Array of sample frequencies
+    w_psd : ndarray
+        Power spectral density of w_cross
+    """
+    # Initalize dimentions parameters
+    if nt is None:
+        nt = w_cross.shape[0] - t0
+    if nperseg is None:
+        nperseg = w_cross.shape[1]
+    # initialize power spectrum array for each timestep
+    # assuming nlon==nlat and power spectrum return an
+    # array with size 19 (may change based on your setup)
+    w_t = w_cross.isel(time=t0).values
+    detrend=False # 'linear'
+    freq, _ = welch(w_t, fs=fs, detrend=detrend, nperseg=nperseg, scaling='spectrum', average='median', **kwargs)
+    nfreq = len(freq)
+    w_psd = np.zeros((nt,ncol,nfreq))
+    # start at t0=4 (day 2) to allow for spin up
+    for t in range(t0,t0+nt):
+        tt = t-t0 # for indexing power spectrum array
+        w_t = w_cross.isel(time=t).values
+        # Estimate power spectral density using Welch’s method across the x and y direction
+        # combine x and y information into a single array for calculating the w psd
+        for k in range(ncol):
+            if k<(ncol):
+                freq, w_psd[tt,:] = welch(w_t[:], fs=fs, detrend=detrend, nperseg=ncol, scaling='spectrum', average='median', **kwargs)
+    print("Returning freq, w_psd using Welch's method with...")
+    print("       fs =", fs)
+    print("  detrend =", detrend)
+    print("  scaling = spectrum")
+    print("  average = median")
+    print("  nperseg =", ncol)
+    print("start time=",w_cross.time[t0].values)
+    print(" end time =",w_cross.time[t0+nt-1].values)
+    print("total time=",(w_cross.time[t0+nt-1].values-w_cross.time[t0].values))
+    print("    ... returned.")
+    return (freq, w_psd)
+
 def calc_geodesic_distance(latlon0, latlon1):
     """ Calculates the distance between two points
         given in (lon) coords, returns the distance
@@ -413,7 +586,8 @@ def plot_model_w_psd(freq, psd, ax=None, color='b', label="SCREAM", units="m/s",
     # Take statistics over all times, latitudes, and longitudes
     wavelen = 1/freq
     ix = np.argmin(abs(wavelen-7*res))
-    print("EFFECTIVE RESOLUTION = 7 dx =",7*res, " ~ ", wavelen[:ix], "km")
+    print("EFFECTIVE RESOLUTION = 7 dx =",7*res, " ~ ", wavelen[ix], "km")
+    print("x,y shape:", wavelen.shape, psd.shape)
     ax.loglog(wavelen[:], np.median(psd, axis=(0,1))[:], color, label=label, *kwargs)
     # ax.loglog(1/(freq), np.quantile(psd,0.05,axis=(0,1)), color, linestyle='dashed', **kwargs)
     # ax.loglog(1/(freq), np.quantile(psd,0.95,axis=(0,1)), color, linestyle='dashed', **kwargs)
@@ -422,10 +596,10 @@ def plot_model_w_psd(freq, psd, ax=None, color='b', label="SCREAM", units="m/s",
     #                 np.quantile(psd,0.75,axis=(0,1)),
     #                 color=color, alpha=.25, **kwargs)
     ax.set(xlabel='Wavelength (km)',
-           ylabel=f"Power ({units}$^2$ s$^{-1}$)",
-           xlim=(0.5,100), ylim=(1e-7,10),
+           ylabel=f"Power ([{units}]$^2$/s)",
+           xlim=(0.5,100), ylim=(1e-7,1e-2),
         #    xticks=np.arange(1,101,10),
-        #    xscale='log', 
+           xscale='log', 
            yscale='log',
            )
     return ax
@@ -555,3 +729,31 @@ def fix_longitudes(lon):
        (not 0 to 360)"""
     return ((lon + 180) % 360) - 180
 
+def find_figure_dir():
+    if os.path.isdir("../plots/"):
+        savename="../plots/"
+    elif os.path.isdir("../plot/"):
+        savename="../plot/"
+    elif os.path.isdir("../figs/"):
+        savename="../figs/"
+    elif os.path.isdir("../figures/"):
+        savename="../figures/"
+    elif os.path.isdir("plots/"):
+        savename="plots/"
+    elif os.path.isdir("plot/"):
+        savename="plot/"
+    elif os.path.isdir("figs/"):
+        savename="figs/"
+    elif os.path.isdir("figures/"):
+        savename="figures/"
+    elif os.path.isdir("../../plots/"):
+        savename="../../plots/"
+    elif os.path.isdir("../../plot/"):
+        savename="../../plot/"
+    elif os.path.isdir("../../figs/"):
+        savename="../../figs/"
+    elif os.path.isdir("../../figures/"):
+        savename="../../figures/"
+    else:
+        savename=""
+    return savename

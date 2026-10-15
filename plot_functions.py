@@ -15,10 +15,173 @@ import numpy as np
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib import cm
+from geopy.distance import geodesic
 from scipy.interpolate import griddata
+from metpy import units as mpunits
+from metpy.interpolate import cross_section as mp_cross_section
+
 import xarray as xr
+import pandas as pd
+import matplotlib.colors as mcolors
 
 
+# Create custom colormap for ice water path (transparent at low values)
+cdict = {
+    'red':   [(0, 1, 1), (1, 1, 1)],
+    'green': [(0, 1, 1), (1, 1, 1)],
+    'blue':  [(0, 1, 1), (1, 1, 1)],
+    'alpha': [(0, 0, 0), (1, 1, 1)],  # key: alpha 0 → 1
+}
+my_cm = mcolors.LinearSegmentedColormap(
+    'my_cm', cdict
+)
+
+def fix_longitudes(lon):
+    """fix longitude so that it is always from -180 to 180 
+       (not 0 to 360)"""
+    return ((lon + 180) % 360) - 180
+
+def get_latlon_box(ds, lat0, lat1, lon0, lon1, lats=None, lons=None):
+    """Returns a subsection of the dataset within the lat-lon box"""
+    if lats is None:
+        # Get lats and lons
+        lats = ds.lat.values
+    if lons is None:
+        lons = fix_longitudes(ds.lon.values)
+
+    # Normalize bounds
+    lat_min, lat_max = min(lat0, lat1), max(lat0, lat1)
+    lon_min, lon_max = min(lon0, lon1), max(lon0, lon1)
+
+    # Latitude mask
+    lat_mask = (lats >= lat_min) & (lats <= lat_max)
+
+    # Longitude mask with wrap handling
+    if lon0 <= lon1:
+        lon_mask = (lons >= lon0) & (lons <= lon1)
+    else:
+        # box crosses dateline in normalized coordinates
+        lon_mask = (lons >= lon0) | (lons <= lon1)
+
+    col_mask = lat_mask & lon_mask
+    sel_idxs = np.where(col_mask)[0]
+
+    return ds.isel({"ncol":sel_idxs})
+
+def get_cross_section(da, start_latlon, end_latlon, n_points=100, hres=None):
+    """
+    Extracts a cross-section from an unstructured (ncol, lev) DataArray.
+    
+    Parameters:
+    -----------
+    da : xarray.DataArray
+        The input data with dimensions (ncol, lev).
+    start_latlon : tuple
+        (lat0, lon0)
+    end_latlon : tuple
+        (lat1, lon1)
+    n_points : int (optional, must have either n_points or hres)
+        Number of sampling points along the line.
+    hres : float (optional, must have either n_points or hres)
+        Resolution in km for the grid spacing along the trajectory of the cross section.
+        If hres is not None, it overwrites the value of n_points.
+
+    --------
+    Usage example:
+        cs = get_cross_section(ds.T_mid, (24.0, -118.0), (43.0, -118.5), n_points=200)
+        cs.plot(x='distance', y='lev', yincrease=False)
+    """
+    dist_km = geodesic(start_latlon, end_latlon).km
+    # Get the geodesic distance between start and end points in km
+    if hres is not None:
+        n_points = int(dist_km//hres)
+        print(f"Distance between {start_latlon} and {end_latlon} is {dist_km} km ({n_points} points with hres={hres} km).")
+
+    # 1. Generate points along the cross-section line
+    lats_line = np.linspace(start_latlon[0], end_latlon[0], n_points)
+    lons_line = np.linspace(start_latlon[1], end_latlon[1], n_points)
+    
+    # 2. Find nearest ncol for each point (Nearest Neighbor)
+    # Using broadcasting to find the minimum distance for every point on the line
+    # Note: For very large datasets, consider a KDTree for performance.
+    lat_diff = da.lat.values[None, :] - lats_line[:, None]
+    lon_diff = da.lon.values[None, :] - lons_line[:, None]
+    dist_sq = lat_diff**2 + lon_diff**2
+    
+    nearest_ncol_indices = dist_sq.argmin(axis=1)
+    
+    # 3. Subset the DataArray
+    # This maps each 'distance' step to the best 'ncol'
+    section = da.isel(ncol=nearest_ncol_indices)
+    uniq_ncols = len(np.unique(nearest_ncol_indices))
+    if (uniq_ncols/len(nearest_ncol_indices)) < 0.7:
+        print('----WARNING----')
+        print('Number of unique points:', uniq_ncols)
+        print('Fraction of unique points',uniq_ncols/len(nearest_ncol_indices))
+        raise Exception('Not getting uique points for the cross section, see above print statemtn in output')
+    
+    # 4. Finalize dimensions and coordinates
+    # Rename ncol to 'distance' to distinguish from the original grid
+    section = section.rename({'ncol': 'index'})
+    
+    # Add coordinate metadata for plotting
+    section = section.assign_coords(
+        index=np.arange(n_points),
+        lat_section=('index', lats_line),
+        lon_section=('index', lons_line)
+    )
+
+    section = section.assign_coords(
+        distance=('index',np.linspace(0,dist_km,n_points))
+    )
+    
+    return section
+
+def get_cross_section_latlon(da, start_latlon, end_latlon, n_points=100, hres=None):
+    """
+    Extracts a cross-section from a regular lat-lon DataArray.
+    
+    Parameters:
+    -----------
+    da : xarray.DataArray
+        The input data with dimensions (lat, lon, lev).
+    start_latlon : tuple
+        (lat0, lon0)
+    end_latlon : tuple
+        (lat1, lon1)
+    n_points : int (optional, must have either n_points or hres)
+        Number of sampling points along the line.
+    hres : float (optional, must have either n_points or hres)
+        Resolution in km for the grid spacing along the trajectory of the cross section.
+        If hres is not None, it overwrites the value of n_points.
+
+    --------
+    Usage example:
+        cs = get_cross_section(ds.T_mid, (24.0, -118.0), (43.0, -118.5), n_points=200)
+        cs.plot(x='distance', y='lev', yincrease=False)
+    """
+    dist_km = geodesic(start_latlon, end_latlon).km
+    # Get the geodesic distance between start and end points in km
+    if hres is not None:
+        n_points = int(dist_km//hres)
+        print(f"Distance between {start_latlon} and {end_latlon} is {dist_km} km ({n_points} points with hres={hres} km).")
+
+    da = da.metpy.parse_cf()
+    print("da with metpy parse cf", da)
+    section = mp_cross_section(da, start_latlon, end_latlon, steps=n_points, interp_type="nearest")
+    
+    section = section.assign_coords(
+        distance=('index',np.linspace(0,dist_km,n_points))
+    )
+
+    return section
+
+def set_secondary_axis_latlon(ax, start, end, x0=0, x1=1):
+    ax2 = ax.secondary_xaxis(location=-0.1)
+    ax2.set_xticks([x0,x1])
+    ax2.set_xticklabels([f'{start[0]}$^\circ$N, {start[1]}$^\circ$E',f'{end[0]}$^\circ$N, {end[1]}$^\circ$E'])
+    ax2.spines["bottom"].set_visible(False) # Hide spine line
+    return ax2
 
 def setup_map_carrm(ncols, nrows, nax, fig, proj=ccrs.PlateCarree(), tight=False):
     ax = fig.add_subplot(ncols, nrows, nax, projection=proj)
@@ -38,7 +201,7 @@ def setup_map_global(fig, proj=ccrs.PlateCarree()):
     ax = fig.add_subplot(1,1,1, projection=proj)
     ax.set_global()
     ax.coastlines()
-    ax.add_feature(cfeature.STATES, edgecolor='black', linewidth=0.5)
+    # ax.add_feature(cfeature.STATES, edgecolor='black', linewidth=0.5)
     ax.gridlines(draw_labels=True)
     return ax
 
@@ -46,15 +209,10 @@ def setup_map_global(fig, nrow, ncol, idx, region_extent=[-180, 180, -90, 90], p
     ax = fig.add_subplot(nrow, ncol, idx, projection=proj)
     ax.set_global()
     ax.coastlines(resolution='50m', linewidth=0.5)
-    ax.add_feature(cfeature.BORDERS, edgecolor='black', linewidth=0.25)
+    # ax.add_feature(cfeature.BORDERS, edgecolor='black', linewidth=0.25)
     ax.gridlines(draw_labels=True)
     ax.set_extent(region_extent, crs=proj)
     return ax
-
-def fix_longitudes(lon):
-    """fix longitude so that it is always from -180 to 180 
-       (not 0 to 360)"""
-    return ((lon + 180) % 360) - 180
 
 def plot_map(x, y, data, ax=None, proj=None, method='tri', nlon=360, nlat=180, clabel=None, **kwargs):
     """plot a geologic map using triangulation"""
@@ -81,6 +239,28 @@ def plot_map(x, y, data, ax=None, proj=None, method='tri', nlon=360, nlat=180, c
 
     # Return plot and colorbar
     return ax, cb
+
+def undo_rolling_average_era(da,time_ind="valid_time"):
+    """radiation variables are given as accumulated"""
+    # new time index will be half way between old time indices
+    ds_time0 = pd.to_datetime(da[time_ind].values)
+    dt = ds_time0[1]-ds_time0[0]
+    print(dt.total_seconds(), 'seconds')
+    ds_time05 = ds_time0[:-1] + dt/2
+    print(ds_time0)
+    print(ds_time05)
+    # undo accumulation (accumulation over output timestep) 
+    # divide by the seconds in timestep to get mean value in each hour
+    # down is positive in reanalysis, so change to up is pos coords
+    unacc_array = -1*(da.values)/3600  #dt.total_seconds()
+    da_new = xr.DataArray(unacc_array, dims=[time_ind,'latitude','longitude'],
+                            coords={time_ind:ds_time0,
+                                    'latitude':da.latitude,
+                                    'longitude':da.longitude},
+                            attrs={'long_name':f'Unaccumulated {da.attrs['long_name']}',
+                                    'units':'W m**-2'})
+    return da_new
+
 
 def dennisplot(stat, olr, alb, var=None, xbins=None, ybins=None, units=None, savename=None,
                levels=None, cmap=cm.ocean_r, ax=None, save=False, colorbar_on=True, fs=20, contour_on=False,
@@ -217,3 +397,82 @@ def dennisplot(stat, olr, alb, var=None, xbins=None, ybins=None, units=None, sav
     else:
         ret = ax, csn
     return ret
+
+def open_uv_from_rotated_um_datset(um_file_name):
+    """Code from Sid Gumber (BAS) to convert from polar 
+    lat lon coordinates to regular lat lon"""
+    ds3 = xr.open_dataset(
+        um_file_name,
+        chunks="auto" # lazily loads the file 
+    )
+    u = ds3["U"]
+    v = ds3["V"]
+
+    # Get rotated-pole information
+    grid_mapping_var = next(
+        (
+            name for name in ["rotated_pole", "rotated_latitude_longitude"]
+            if name in ds3
+        ),
+        None
+    )
+
+    if grid_mapping_var is None:
+        raise ValueError("Could not find rotated-pole grid mapping in ds3")
+
+    pole_lat = ds3[grid_mapping_var].attrs["grid_north_pole_latitude"]
+    pole_lon = ds3[grid_mapping_var].attrs["grid_north_pole_longitude"]
+
+    print("Rotated pole latitude :", pole_lat)
+    print("Rotated pole longitude:", pole_lon)
+
+    gm = ds3["rotated_latitude_longitude"]
+
+    rotated_cs = iris.coord_systems.RotatedGeogCS(
+        grid_north_pole_latitude=float(
+            gm.attrs["grid_north_pole_latitude"]
+        ),
+        grid_north_pole_longitude=float(
+            gm.attrs["grid_north_pole_longitude"]
+        )
+    )
+
+    print(rotated_cs)
+
+    u_cube = u.to_iris()
+    v_cube = v.to_iris()
+
+    # Attach the rotated-pole coordinate system
+    for cube in (u_cube, v_cube):
+        cube.coord("grid_longitude").coord_system = rotated_cs
+        cube.coord("grid_latitude").coord_system = rotated_cs
+
+    print("U x CS:", u_cube.coord(axis="x").coord_system)
+    print("U y CS:", u_cube.coord(axis="y").coord_system)
+
+    # Rotate
+    u_geo_cube, v_geo_cube = cart.rotate_winds(
+        u_cube,
+        v_cube,
+        target_cs=iris.coord_systems.GeogCS(6371229.0)
+    )
+
+    print("Rotation graph/result created.")
+
+    u_geo_cube.data = u_geo_cube.core_data()
+    v_geo_cube.data = v_geo_cube.core_data()
+
+    print("Computation complete.")
+
+    # Back to Xarray
+    u_geo = xr.DataArray.from_iris(u_geo_cube)
+    v_geo = xr.DataArray.from_iris(v_geo_cube)
+    #pmomx_geo = xr.DataArray.from_iris(pmomx_geo_cube)#
+    #pmomy_geo = xr.DataArray.from_iris(pmomy_geo_cube)
+
+    print("u_geo shape:", u_geo.shape)
+    print("u_geo dims:", u_geo.dims)
+
+    print("v_geo shape:", v_geo.shape)
+    print("v_geo dims:", v_geo.dims)
+    return u_geo, v_geo
